@@ -3,27 +3,14 @@
 require "ed25519"
 require "base64"
 require "ostruct"
+require "time"
 
 module UniKey
   class TrustPacket
-    # Verifies Trust Packet signatures using DNS-published public keys.
-    #
-    # No middleman server needed - verification is entirely self-contained:
-    #   1. Parse the packet structure
-    #   2. Canonicalize the unsigned portion
-    #   3. Look up signer's public key from DNS
-    #   4. Verify Ed25519 signature
-    #   5. Check expiration and claims
-    #
+    # RFC-2001 Trust Packet verification using DNS-published public keys.
     module Verifier
       module_function
 
-      # Verify a Trust Packet and return verified info
-      #
-      # @param packet_data [Hash] the full packet (header, claims, payload, signatures)
-      # @return [OpenStruct] verified info with subject, action, signer, scope, etc.
-      # @raise [UniKey::InvalidPacket, UniKey::InvalidSignature, UniKey::ExpiredRequest,
-      #         UniKey::DNSLookupFailed, UniKey::UntrustedSigner]
       def verify!(packet_data)
         validate_structure!(packet_data)
 
@@ -32,10 +19,13 @@ module UniKey
         payload = packet_data[:payload]
         signatures = packet_data[:signatures]
 
-        # Check expiration
-        expires = header[:expires].to_i
-        if expires > 0 && Time.now.to_i > expires
-          raise UniKey::ExpiredRequest
+        # Check expiration (ISO 8601 string)
+        expires_at = header[:expires_at]
+        if expires_at
+          expires_unix = Time.parse(expires_at.to_s).to_i rescue 0
+          if expires_unix > 0 && Time.now.to_i > expires_unix
+            raise UniKey::ExpiredRequest
+          end
         end
 
         # Check trusted signers
@@ -58,8 +48,12 @@ module UniKey
           verify_signature!(canonical, sig)
         end
 
-        # Validate delegation chain scope narrowing (RFC-001 §5.3)
+        # Validate delegation chain scope narrowing (RFC-1200)
         validate_delegation_chain!(claims) if claims[:delegation_chain]&.any?
+
+        # Parse timestamps for result
+        issued_unix = Time.parse(header[:issued_at].to_s).to_i rescue 0
+        expires_unix = Time.parse(expires_at.to_s).to_i rescue 0
 
         # Return verified info
         OpenStruct.new(
@@ -76,12 +70,11 @@ module UniKey
           callback_url: payload.dig(:params, :callback_url) || payload.dig(:params, "callback_url"),
           signer: signer_domain,
           delegation_chain: claims[:delegation_chain],
-          timestamp: Time.at(header[:timestamp].to_i),
-          expires_at: expires > 0 ? Time.at(expires) : nil
+          timestamp: issued_unix > 0 ? Time.at(issued_unix) : nil,
+          expires_at: expires_unix > 0 ? Time.at(expires_unix) : nil
         )
       end
 
-      # Verify without raising (returns nil on failure)
       def verify(packet_data)
         verify!(packet_data)
       rescue UniKey::Error
@@ -96,7 +89,7 @@ module UniKey
 
         raise UniKey::InvalidPacket.new("No signatures") if data[:signatures].empty?
 
-        %i[version packet_type packet_id timestamp].each do |field|
+        %i[tp_version packet_id issued_at].each do |field|
           raise UniKey::InvalidPacket.new("Missing header.#{field}") unless data[:header][field]
         end
 
@@ -114,7 +107,6 @@ module UniKey
         signer_domain = sig[:signer]
         signature_b64 = sig[:signature]
 
-        # Look up public key from DNS (uses hardened resolver if configured)
         public_key_b64 = if UniKey.configuration.dns_hardening_enabled
                            UniKey::HardenedDNS.lookup(signer_domain)
                          else
@@ -132,18 +124,13 @@ module UniKey
         end
       end
 
-      # @private - RFC-001 §5.3: Delegations can only narrow scope
+      # @private
       def validate_delegation_chain!(claims)
-        # For now, we just validate the chain exists and is well-formed.
-        # Full scope narrowing validation requires comparing parent scopes,
-        # which would need the parent packets.
         chain = claims[:delegation_chain]
         return if chain.nil? || chain.empty?
 
         chain.each do |link|
-          unless link.is_a?(String) && link.include?("→")
-            # Allow both arrow formats
-            next if link.is_a?(String) && link.include?("->")
+          unless link.is_a?(String) && (link.include?("→") || link.include?("->"))
             # Warn but don't fail for now
           end
         end

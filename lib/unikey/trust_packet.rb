@@ -44,17 +44,19 @@ module UniKey
 
     # Build and sign a new Trust Packet
     def self.build(subject:, audience:, action:, signing_key:, signer_domain:,
-                   scope: ["*"], params: {}, message: nil,
+                   scope: ["*"], params: {}, message: nil, context: "",
                    packet_type: "action_request", delegation_chain: [],
                    ttl: 300)
       now = Time.now.to_i
 
       header = Header.new(
-        version: VERSION,
+        tp_version: VERSION,
         packet_type: packet_type,
-        packet_id: "pkt_#{SecureRandom.hex(16)}",
-        timestamp: now,
-        expires: now + ttl
+        packet_id: SecureRandom.uuid,
+        issued_at: Time.at(now).utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        expires_at: Time.at(now + ttl).utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        nonce: SecureRandom.hex(16),
+        canonicalization: "unikey-json-v1"
       )
 
       claims = Claims.new(
@@ -62,6 +64,7 @@ module UniKey
         issuer: signer_domain,
         audience: audience,
         scope: Array(scope),
+        context: context || "",
         delegation_chain: Array(delegation_chain)
       )
 
@@ -80,9 +83,8 @@ module UniKey
       signature = Signature.new(
         algorithm: "ed25519",
         signer: signer_domain,
-        key_selector: "unikey",
-        signature: Base64.strict_encode64(sig_bytes),
-        signed_at: now
+        key_id: "unikey",
+        signature: Base64.strict_encode64(sig_bytes)
       )
 
       packet.instance_variable_set(:@signatures, [signature])
@@ -151,7 +153,9 @@ module UniKey
     end
 
     def expired?
-      header.expires > 0 && Time.now.to_i > header.expires
+      return false unless header.expires_at
+      expires_unix = Time.parse(header.expires_at).to_i rescue 0
+      expires_unix > 0 && Time.now.to_i > expires_unix
     end
 
     private
@@ -170,27 +174,27 @@ module UniKey
 
     # ============== Inner Structs ==============
 
-    # RFC-001 §3.1 Header
-    Header = Struct.new(:version, :packet_type, :packet_id, :timestamp, :expires, keyword_init: true) do
+    # RFC-2001 §5.2 Header
+    Header = Struct.new(:tp_version, :packet_type, :packet_id, :issued_at, :expires_at, :nonce, :canonicalization, keyword_init: true) do
       def to_h
-        { version: version, packet_type: packet_type, packet_id: packet_id,
-          timestamp: timestamp, expires: expires }
+        { tp_version: tp_version, packet_type: packet_type, packet_id: packet_id,
+          issued_at: issued_at, expires_at: expires_at, nonce: nonce, canonicalization: canonicalization }
       end
     end
 
-    # RFC-001 §3.2 Claims
-    Claims = Struct.new(:subject, :issuer, :audience, :scope, :delegation_chain, keyword_init: true) do
-      def initialize(scope: ["*"], delegation_chain: [], **rest)
-        super(scope: Array(scope), delegation_chain: Array(delegation_chain), **rest)
+    # RFC-2001 §5.2 Claims
+    Claims = Struct.new(:subject, :issuer, :audience, :scope, :context, :delegation_chain, keyword_init: true) do
+      def initialize(scope: ["*"], context: "", delegation_chain: [], **rest)
+        super(scope: Array(scope), context: context || "", delegation_chain: Array(delegation_chain), **rest)
       end
 
       def to_h
         { subject: subject, issuer: issuer, audience: audience,
-          scope: scope, delegation_chain: delegation_chain }
+          scope: scope, context: context, delegation_chain: delegation_chain }
       end
     end
 
-    # RFC-001 §3.3 Payload
+    # RFC-2001 §5.2 Payload
     Payload = Struct.new(:action, :params, :message, keyword_init: true) do
       def initialize(params: {}, **rest)
         super(params: params || {}, **rest)
@@ -201,11 +205,10 @@ module UniKey
       end
     end
 
-    # RFC-001 §3.4 Signature
-    Signature = Struct.new(:algorithm, :signer, :key_selector, :signature, :signed_at, keyword_init: true) do
+    # RFC-2001 §5.2 Signature
+    Signature = Struct.new(:algorithm, :signer, :key_id, :signature, keyword_init: true) do
       def to_h
-        { algorithm: algorithm, signer: signer, key_selector: key_selector,
-          signature: signature, signed_at: signed_at }
+        { algorithm: algorithm, signer: signer, key_id: key_id, signature: signature }
       end
     end
   end
